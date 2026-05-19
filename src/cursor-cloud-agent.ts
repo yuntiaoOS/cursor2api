@@ -134,8 +134,9 @@ async function pollRunUntilTerminal(
     apiKey: string,
     agentId: string,
     runId: string,
+    maxAttempts = 45,
 ): Promise<string> {
-    for (let i = 0; i < 180; i++) {
+    for (let i = 0; i < maxAttempts; i++) {
         const r = await apiJson(cfg, apiKey, 'GET', `agents/${agentId}/runs/${runId}`);
         assertOk(r, 'poll run');
         const status = String(r.json?.status ?? '').toUpperCase();
@@ -205,6 +206,8 @@ export interface CloudAgentStreamCallbacks {
     onAssistantText?: (text: string) => void;
     onThinkingText?: (text: string) => void;
     onStatus?: (status: string) => void;
+    /** Run 进入终态（FINISHED/FAILED/CANCELLED）时立即回调，用于向客户端发送结束事件 */
+    onTerminal?: (status: string) => void;
 }
 
 interface StreamState {
@@ -216,6 +219,18 @@ interface StreamState {
     failed: boolean;
     errorText: string;
     streamExpired: boolean;
+    terminalNotified: boolean;
+}
+
+function notifyTerminal(
+    state: StreamState,
+    callbacks: CloudAgentStreamCallbacks,
+    status: string,
+): void {
+    if (state.terminalNotified) return;
+    state.terminalNotified = true;
+    state.done = true;
+    callbacks.onTerminal?.(status);
 }
 
 function handleSseEvent(
@@ -239,9 +254,13 @@ function handleSseEvent(
     } else if (eventName === 'status' || eventName === 'result') {
         state.status = String(data.status ?? state.status).toUpperCase();
         callbacks.onStatus?.(state.status);
+        if (TERMINAL_STATES.has(state.status)) {
+            notifyTerminal(state, callbacks, state.status);
+        }
     } else if (eventName === 'error') {
         state.failed = true;
         state.errorText = String(data.message ?? JSON.stringify(data));
+        notifyTerminal(state, callbacks, 'FAILED');
     }
 }
 
@@ -380,6 +399,7 @@ export async function runCloudAgentChat(options: {
         failed: false,
         errorText: '',
         streamExpired: false,
+        terminalNotified: false,
     };
 
     const callbacks = options.callbacks ?? {};
@@ -402,7 +422,11 @@ export async function runCloudAgentChat(options: {
     }
 
     if (!state.done && !TERMINAL_STATES.has(state.status)) {
-        state.status = await pollRunUntilTerminal(ca, apiKey, agentId, runId);
+        const pollMax = state.streamExpired || state.content.length > 0 ? 30 : 90;
+        state.status = await pollRunUntilTerminal(ca, apiKey, agentId, runId, pollMax);
+        if (TERMINAL_STATES.has(state.status) && !state.terminalNotified) {
+            notifyTerminal(state, callbacks, state.status);
+        }
     }
 
     sessions.set(options.sessionKey, { agentId, latestRunId: runId, updatedAt: Date.now() });

@@ -20,8 +20,69 @@ function chatId(): string {
     return 'chatcmpl-' + uuidv4().replace(/-/g, '').substring(0, 24);
 }
 
+function flushResponse(res: Response): void {
+    // @ts-expect-error flush on compression middleware
+    if (typeof res.flush === 'function') res.flush();
+}
+
 function writeSSE(res: Response, event: string, data: unknown): void {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    flushResponse(res);
+}
+
+type AnthropicStreamState = {
+    blockIndex: number;
+    textBlockStarted: boolean;
+    thinkingEmitted: boolean;
+};
+
+function finalizeAnthropicStream(
+    res: Response,
+    streamState: AnthropicStreamState,
+    fullText: string,
+    status: string,
+    failed: boolean,
+    fallbackText?: string,
+): void {
+    if (streamState.thinkingEmitted) {
+        writeSSE(res, 'content_block_stop', {
+            type: 'content_block_stop',
+            index: streamState.blockIndex,
+        });
+        streamState.blockIndex++;
+    }
+
+    if (!streamState.textBlockStarted) {
+        const text = fallbackText || (failed ? `Cloud Agent run failed (${status})` : '');
+        if (text) {
+            writeSSE(res, 'content_block_start', {
+                type: 'content_block_start',
+                index: streamState.blockIndex,
+                content_block: { type: 'text', text: '' },
+            });
+            streamState.textBlockStarted = true;
+            writeSSE(res, 'content_block_delta', {
+                type: 'content_block_delta',
+                index: streamState.blockIndex,
+                delta: { type: 'text_delta', text: sanitizeResponse(text) },
+            });
+        }
+    }
+
+    if (streamState.textBlockStarted) {
+        writeSSE(res, 'content_block_stop', {
+            type: 'content_block_stop',
+            index: streamState.blockIndex,
+        });
+    }
+
+    const stopReason = failed ? 'end_turn' : 'end_turn';
+    writeSSE(res, 'message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { output_tokens: Math.max(1, Math.ceil(fullText.length / 4)) },
+    });
+    writeSSE(res, 'message_stop', { type: 'message_stop' });
 }
 
 function blockToText(block: AnthropicContentBlock): string {
@@ -153,12 +214,16 @@ async function handleCloudAgentStream(
         },
     });
 
-    const streamState = { blockIndex: 0, textBlockStarted: false, thinkingEmitted: false };
+    const streamState: AnthropicStreamState = {
+        blockIndex: 0,
+        textBlockStarted: false,
+        thinkingEmitted: false,
+    };
     let fullText = '';
-    let fullThinking = '';
+    let streamFinalized = false;
 
     const emitThinking = (chunk: string) => {
-        if (!chunk || streamState.thinkingEmitted) return;
+        if (!chunk) return;
         if (!streamState.thinkingEmitted) {
             writeSSE(res, 'content_block_start', {
                 type: 'content_block_start',
@@ -193,6 +258,12 @@ async function handleCloudAgentStream(
         });
     };
 
+    const finalizeOnce = (status: string, failed: boolean, fallbackText?: string) => {
+        if (streamFinalized) return;
+        streamFinalized = true;
+        finalizeAnthropicStream(res, streamState, fullText, status, failed, fallbackText);
+    };
+
     try {
         const result = await runCloudAgentChat({
             promptText,
@@ -200,47 +271,37 @@ async function handleCloudAgentStream(
             existingAgentId,
             callbacks: {
                 onThinkingText: (t) => {
-                    fullThinking += t;
                     if (body.thinking?.type === 'enabled') emitThinking(t);
                 },
                 onAssistantText: emitText,
+                onTerminal: (status) => {
+                    finalizeOnce(status, status === 'FAILED' || status === 'CANCELLED');
+                },
             },
         });
 
         res.setHeader('X-Cursor-Agent-Id', result.agentId);
         res.setHeader('X-Cursor-Run-Id', result.runId);
 
-        if (streamState.thinkingEmitted) {
-            writeSSE(res, 'content_block_stop', {
-                type: 'content_block_stop',
-                index: streamState.blockIndex,
-            });
-            streamState.blockIndex++;
+        if (!streamFinalized) {
+            if (!fullText && result.failed) {
+                emitText(result.assistantText || `Cloud Agent run failed (${result.status})`);
+            }
+            finalizeOnce(
+                result.status,
+                result.failed,
+                result.failed ? result.assistantText : undefined,
+            );
         }
-
-        if (!fullText && result.failed) {
-            emitText(result.assistantText || `Cloud Agent run failed (${result.status})`);
-        }
-
-        if (streamState.textBlockStarted) {
-            writeSSE(res, 'content_block_stop', {
-                type: 'content_block_stop',
-                index: streamState.blockIndex,
-            });
-        }
-
-        const stopReason = result.failed ? 'end_turn' : 'end_turn';
-        writeSSE(res, 'message_delta', {
-            type: 'message_delta',
-            delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: { output_tokens: Math.ceil(fullText.length / 4) },
-        });
-        writeSSE(res, 'message_stop', { type: 'message_stop' });
         log.complete(fullText.length, result.status);
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         log.fail(message);
-        writeSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } });
+        if (!streamFinalized) {
+            finalizeOnce('FAILED', true, message);
+        } else {
+            writeSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } });
+        }
     }
     res.end();
 }
@@ -328,11 +389,21 @@ export async function handleCloudAgentOpenAIChat(req: Request, res: Response): P
                 }],
             })}\n\n`);
         };
-        writeChunk(null, null);
         res.write(`data: ${JSON.stringify({
             id, object: 'chat.completion.chunk', created, model: body.model,
             choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
         })}\n\n`);
+        flushResponse(res);
+
+        let openAiFinalized = false;
+        const finishOpenAI = (failed: boolean, errText?: string) => {
+            if (openAiFinalized) return;
+            openAiFinalized = true;
+            if (errText) writeChunk(errText, null);
+            writeChunk(null, 'stop');
+            res.write('data: [DONE]\n\n');
+            flushResponse(res);
+        };
 
         try {
             const result = await runCloudAgentChat({
@@ -341,15 +412,17 @@ export async function handleCloudAgentOpenAIChat(req: Request, res: Response): P
                 existingAgentId,
                 callbacks: {
                     onAssistantText: (t) => writeChunk(sanitizeResponse(t), null),
+                    onTerminal: () => finishOpenAI(false),
                 },
             });
             res.setHeader('X-Cursor-Agent-Id', result.agentId);
-            writeChunk(null, result.failed ? 'stop' : 'stop');
-            res.write('data: [DONE]\n\n');
+            res.setHeader('X-Cursor-Run-Id', result.runId);
+            if (!openAiFinalized) {
+                finishOpenAI(result.failed, result.failed ? result.assistantText : undefined);
+            }
         } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            writeChunk(`Error: ${msg}`, 'stop');
-            res.write('data: [DONE]\n\n');
+            finishOpenAI(true, `Error: ${msg}`);
         }
         res.end();
         return;
