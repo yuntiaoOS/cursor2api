@@ -17,8 +17,8 @@ timeout: 120
 # 客户端使用方式：Authorization: Bearer <token> 或 x-api-key: <token>
 # 支持多个 token（数组格式），不配置则全部放行
 # 环境变量: AUTH_TOKEN=token1,token2 (逗号分隔)
-# auth_tokens:
-#   - "sk-your-secret-token-1"
+auth_tokens:
+  - "sk-yunshang-900405"
 #   - "sk-your-secret-token-2"
 
 # ==================== 代理设置 ====================
@@ -30,7 +30,7 @@ timeout: 120
 # proxy: "http://127.0.0.1:7890"
 
 # Cursor 使用的模型
-cursor_model: "google/gemini-3-flash"
+cursor_model: "composer-2-fast"
 
 # ==================== 自动续写配置 ====================
 # 当模型输出被截断时，自动发起续写请求的最大次数
@@ -220,10 +220,33 @@ tools:
 # 环境变量: STEALTH_PROXY=http://stealth-proxy:3011
 # stealth_proxy: "http://stealth-proxy:3011"
 
-# ==================== Cursor Cookie（手动方式，通过 Vercel 安全验证） ====================
-# Cursor 网站启用了 Vercel 安全检查点，需要携带有效 Cookie 才能正常访问 API
-# 获取方式：浏览器打开 cursor.com → F12 开发者工具 → Network → 复制任意请求的 Cookie 头
-# 关键 Cookie：_vcrcs（Vercel 验证令牌），过期后需重新获取
+# ==================== Cursor Cloud Agent（api.cursor.com/v1/agents） ====================
+# 与文档页 /api/chat 互斥：enabled 且配置 CURSOR_API_KEY 时，/v1/messages 走 Cloud Agent。
+# 需本机 worker：agent worker start --name <env_name> --worker-dir <仓库目录>
+# 环境变量: CLOUD_AGENT_ENABLED=true, CLOUD_AGENT_REPO_URL, CLOUD_AGENT_ENV_NAME, ...
+# cloud_agent:
+#   enabled: true
+#   api_base: https://api.cursor.com/v1
+#   model: composer-2.5
+#   repo_url: https://github.com/yuntiaoOS/cursor2api
+#   starting_ref: dev
+#   env_type: machine
+#   env_name: cursor2api-pc
+#   read_timeout: 300
+#   agent_busy_retries: 15
+#   stream_resume_retries: 5
+
+# ==================== Cursor 认证（二选一或组合使用） ====================
+#
+# 方式 1：Session Token（推荐，仅需登录 token）
+# 从 cursor.com 登录后获取，通常为 crsr_ 开头，或浏览器 Cookie 中的 WorkosCursorSessionToken 值
+# 环境变量: CURSOR_SESSION_TOKEN=crsr_...
+# cursor_session_token: "crsr_..."
+#
+# 方式 2：完整 Cookie（手动，通过 Vercel 安全验证）
+# 浏览器打开 cursor.com → F12 → Network → 复制完整 Cookie 头
+# 关键 Cookie：_vcrcs（Vercel 验证令牌，约 1 小时过期）
+# 可与 session token 组合：程序会自动把 token 合并为 WorkosCursorSessionToken=...
 # 环境变量: CURSOR_COOKIE="your_cookie_string"
 # cookie: "generaltranslation.locale-routing-enabled=true; _vcrcs=..."
 

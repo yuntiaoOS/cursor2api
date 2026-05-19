@@ -43,6 +43,8 @@ import {
     MAX_REFUSAL_RETRIES,
     estimateInputTokens,
 } from './handler.js';
+import { isCloudAgentEnabled } from './cursor-cloud-agent.js';
+import { handleCloudAgentOpenAIChat } from './cloud-agent-handler.js';
 
 function chatId(): string {
     return 'chatcmpl-' + uuidv4().replace(/-/g, '').substring(0, 24);
@@ -95,7 +97,7 @@ function unsupportedImageFileError(fileId?: string): OpenAIRequestError {
  * 将 OpenAI Chat Completions 请求转换为内部 Anthropic 格式
  * 这样可以完全复用现有的 convertToCursorRequest 管道
  */
-function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
+export function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
     const rawMessages: AnthropicMessage[] = [];
     let systemPrompt: string | undefined;
 
@@ -484,6 +486,10 @@ export async function handleOpenAIChatCompletions(req: Request, res: Response): 
             } else {
                 return handleOpenAIMockNonStream(res, body, mockText);
             }
+        }
+
+        if (isCloudAgentEnabled()) {
+            return await handleCloudAgentOpenAIChat(req, res);
         }
 
         // Step 2: Anthropic → Cursor 格式（复用现有管道）
@@ -1377,6 +1383,11 @@ export async function handleOpenAIResponses(req: Request, res: Response): Promis
             } else {
                 return handleResponsesNonStreamMock(res, body, mockText);
             }
+        }
+
+        if (isCloudAgentEnabled()) {
+            const fakeReq = Object.assign(req, { body: chatBody }) as Request;
+            return handleCloudAgentOpenAIChat(fakeReq, res);
         }
 
         if (isStream) {

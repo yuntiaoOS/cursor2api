@@ -10,6 +10,7 @@
  */
 
 import type { CursorChatRequest, CursorSSEEvent } from './types.js';
+import { refreshVcrcsOnDenied } from './cursor-auth.js';
 import { getConfig } from './config.js';
 import { getProxyFetchOptions } from './proxy-agent.js';
 
@@ -42,7 +43,10 @@ function getChromeHeaders(): Record<string, string> {
     };
 
     // 携带 Cookie 通过 Vercel 安全验证
-    if (config.cookie) {
+    if (config.apiKey) {
+        headers['authorization'] = `Bearer ${config.apiKey}`;
+    }
+    if (!config.apiKey && config.cookie) {
         headers['cookie'] = config.cookie;
     }
 
@@ -69,8 +73,14 @@ export async function sendCursorRequest(
             if (externalSignal?.aborted) throw err;
             // ★ 退化循环中止不重试 — 已有的内容是有效的，重试也会重蹈覆辙
             if (err instanceof Error && err.message === 'DEGENERATE_LOOP_ABORTED') return;
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg.substring(0, 100)}`);
+            // ★ _vcrcs 刷新后立即重试一次
+            if (err instanceof Error && err.message === 'CURSOR_AUTH_REFRESHED') continue;
+            let msg = err instanceof Error ? err.message : String(err);
+            const cause = err instanceof Error && err.cause instanceof Error ? err.cause : null;
+            if (msg === 'fetch failed' && cause) {
+                msg = `fetch failed (${cause.message})`;
+            }
+            console.error(`[Cursor] 请求失败 (${attempt}/${maxRetries}): ${msg.substring(0, 160)}`);
             if (attempt < maxRetries) {
                 await new Promise(r => setTimeout(r, 2000));
             } else {
@@ -92,10 +102,16 @@ async function sendCursorRequestInner(
     const targetUrl = useStealthProxy
         ? `${config.stealthProxy!.replace(/\/$/, '')}/proxy/chat`
         : CURSOR_CHAT_API;
-    // stealth proxy 内部自带浏览器指纹，不需要 Chrome headers
-    const headers = useStealthProxy
+    // stealth：转发 Cookie（含 session + _vcrcs）；直连：Chrome 指纹 + Cookie
+    const headers: Record<string, string> = useStealthProxy
         ? { 'Content-Type': 'application/json' }
         : getChromeHeaders();
+    if (useStealthProxy && !config.apiKey && config.cookie) {
+        headers['X-Cursor-Cookie'] = config.cookie;
+    }
+    if (useStealthProxy && config.apiKey) {
+        headers['Authorization'] = `Bearer ${config.apiKey}`;
+    }
 
     // 详细日志记录在 handler 层
 
@@ -120,6 +136,14 @@ async function sendCursorRequestInner(
         }, IDLE_TIMEOUT_MS);
     };
 
+    /** 在等待 _vcrcs 等非流式操作时必须停止空闲计时器，否则会误杀超长刷新 */
+    const clearIdleTimer = () => {
+        if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+        }
+    };
+
     // 启动初始计时（等待服务器开始响应）
     resetIdleTimer();
 
@@ -135,7 +159,14 @@ async function sendCursorRequestInner(
         } as any);
 
         if (!resp.ok) {
+            clearIdleTimer();
             const body = await resp.text();
+            if (!config.apiKey && resp.status === 403 && body.includes('Access denied')) {
+                const refreshed = await refreshVcrcsOnDenied(config);
+                if (refreshed) {
+                    throw new Error('CURSOR_AUTH_REFRESHED');
+                }
+            }
             throw new Error(`Cursor API 错误: HTTP ${resp.status} - ${body}`);
         }
 

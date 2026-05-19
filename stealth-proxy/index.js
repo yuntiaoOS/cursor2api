@@ -27,6 +27,53 @@ let requestCount = 0;
 
 const pendingRequests = new Map();
 
+const WORKOS_SESSION_COOKIE = 'WorkosCursorSessionToken';
+
+function normalizeSessionToken(token) {
+    const trimmed = String(token || '').trim();
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) return trimmed;
+    const name = trimmed.slice(0, eq).trim();
+    if (name.toLowerCase() === WORKOS_SESSION_COOKIE.toLowerCase()) {
+        return trimmed.slice(eq + 1).trim();
+    }
+    return trimmed;
+}
+
+/** 将 cursor2api 传来的 Cookie 头写入浏览器上下文 */
+async function applyCookieHeader(cookieHeader) {
+    if (!context || !cookieHeader) return;
+    const pairs = String(cookieHeader)
+        .split(';')
+        .map((p) => p.trim())
+        .filter(Boolean);
+    const cookies = [];
+    for (const part of pairs) {
+        const eq = part.indexOf('=');
+        if (eq <= 0) continue;
+        const name = part.slice(0, eq).trim();
+        const value = part.slice(eq + 1).trim();
+        if (!name || !value) continue;
+        cookies.push({
+            name,
+            value,
+            domain: 'cursor.com',
+            path: '/',
+            secure: true,
+            sameSite: 'Lax',
+        });
+    }
+    if (cookies.length > 0) {
+        await context.addCookies(cookies);
+    }
+}
+
+async function applySessionTokenFromEnv() {
+    const raw = process.env.CURSOR_SESSION_TOKEN;
+    if (!raw) return;
+    await applyCookieHeader(`${WORKOS_SESSION_COOKIE}=${normalizeSessionToken(raw)}`);
+}
+
 // ==================== 浏览器管理 ====================
 
 const fs = require('fs');
@@ -62,8 +109,9 @@ async function initBrowser() {
     const chromium = await loadStealth();
     const chromePath = findSystemChrome();
 
+    const headless = process.env.HEADLESS !== 'false';
     const launchOptions = {
-        headless: true,
+        headless,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -77,6 +125,9 @@ async function initBrowser() {
         console.log(`[Stealth] Using system Chrome: ${chromePath}`);
     } else {
         console.log('[Stealth] System Chrome not found, using Playwright Chromium');
+    }
+    if (!headless) {
+        console.log('[Stealth] Headed mode (HEADLESS=false) — complete captcha in the Chrome window if shown');
     }
 
     console.log('[Stealth] Launching browser...');
@@ -161,6 +212,8 @@ async function initBrowser() {
             }
         },
     );
+
+    await applySessionTokenFromEnv();
 
     ready = true;
     console.log('[Stealth] Ready! Accepting proxy requests.');
@@ -285,6 +338,15 @@ app.post('/proxy/chat', async (req, res) => {
     const requestId = crypto.randomUUID();
     requestCount++;
 
+    const extraCookie = req.headers['x-cursor-cookie'];
+    if (extraCookie) {
+        try {
+            await applyCookieHeader(extraCookie);
+        } catch (e) {
+            console.warn('[Stealth] apply X-Cursor-Cookie failed:', e.message);
+        }
+    }
+
     // 客户端断开时清理
     let aborted = false;
     req.on('close', () => {
@@ -376,37 +438,42 @@ app.post('/proxy/chat', async (req, res) => {
 
 const MAX_INIT_RETRIES = parseInt(process.env.MAX_INIT_RETRIES || '5');
 
+// 先监听端口，验证期间 /health 返回 initializing，避免 cursor2api 连不上 3011
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Stealth] Proxy listening on port ${PORT} (browser challenge in background…)`);
+});
+
 (async () => {
-    // 自动重试启动：网络不稳定时多试几次
     for (let attempt = 1; attempt <= MAX_INIT_RETRIES; attempt++) {
         try {
             console.log(`[Stealth] Initialization attempt ${attempt}/${MAX_INIT_RETRIES}...`);
             await initBrowser();
-            break; // 成功，跳出重试循环
+            break;
         } catch (e) {
             console.error(`[Stealth] Attempt ${attempt} failed:`, e.message);
-            // 清理失败的浏览器实例
             if (browser) await browser.close().catch(() => {});
-            browser = null; context = null; challengePage = null; workerPage = null;
+            browser = null;
+            context = null;
+            challengePage = null;
+            workerPage = null;
 
             if (attempt >= MAX_INIT_RETRIES) {
-                console.error(`[Stealth] All ${MAX_INIT_RETRIES} attempts failed, exiting.`);
-                process.exit(1);
+                console.error(`[Stealth] All ${MAX_INIT_RETRIES} attempts failed.`);
+                return;
             }
             const delay = attempt * 5;
             console.log(`[Stealth] Retrying in ${delay}s...`);
-            await new Promise(r => setTimeout(r, delay * 1000));
+            await new Promise((r) => setTimeout(r, delay * 1000));
         }
     }
 
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`[Stealth] Proxy listening on port ${PORT}`);
-    });
+    if (!ready) {
+        console.error('[Stealth] Failed to become ready; /proxy/chat will return 503.');
+        return;
+    }
 
-    // 定时刷新 challenge
     setInterval(refreshChallenge, REFRESH_INTERVAL);
 
-    // 浏览器崩溃恢复
     browser.on('disconnected', () => {
         console.error('[Stealth] Browser disconnected! Restarting...');
         ready = false;

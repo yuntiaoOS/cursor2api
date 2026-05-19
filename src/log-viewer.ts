@@ -5,7 +5,7 @@
  */
 
 import type { Request, Response } from 'express';
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getAllLogs, getRequestSummaries, getStats, getVueStats, getRequestPayload, subscribeToLogs, subscribeToSummaries, clearAllLogs, getRequestSummariesPage } from './logger.js';
@@ -95,7 +95,20 @@ export function serveLogViewerLogin(_req: Request, res: Response): void {
 }
 
 export function serveVueApp(_req: Request, res: Response): void {
-    res.sendFile(join(publicDir, 'vue', 'index.html'));
+    const vueIndex = join(publicDir, 'vue', 'index.html');
+    if (!existsSync(vueIndex)) {
+        res.status(503).type('html').send(`<!DOCTYPE html><html lang="zh-CN"><body style="font-family:sans-serif;padding:2rem">
+<h2>Vue 日志 UI 尚未构建</h2>
+<p>请任选一种方式：</p>
+<ol>
+<li>使用内置日志页（无需构建）：<a href="/logs">/logs</a>（若配置了 AUTH_TOKEN，请加 <code>?token=你的token</code>）</li>
+<li>构建 Vue UI：<code>cd vue-ui && npm install && npm run build</code>，然后刷新 <a href="/vuelogs">/vuelogs</a></li>
+<li>开发模式：<code>cd vue-ui && npm run dev</code>，访问 <a href="http://localhost:5173">http://localhost:5173</a></li>
+</ol>
+</body></html>`);
+        return;
+    }
+    res.sendFile(vueIndex);
 }
 
 /** 静态文件路由 - CSS/JS */

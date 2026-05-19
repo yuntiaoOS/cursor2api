@@ -18,6 +18,8 @@ import type {
 } from './types.js';
 import { convertToCursorRequest, parseToolCalls, hasToolCalls } from './converter.js';
 import { sendCursorRequest, sendCursorRequestFull } from './cursor-client.js';
+import { isCloudAgentEnabled } from './cursor-cloud-agent.js';
+import { handleCloudAgentMessages } from './cloud-agent-handler.js';
 import { getConfig } from './config.js';
 import { createRequestLogger, type RequestLogger } from './logger.js';
 import { estimateTokens } from './tokenizer.js';
@@ -377,6 +379,10 @@ export async function handleMessages(req: Request, res: Response): Promise<void>
             } else {
                 return await handleMockIdentityNonStream(res, body);
             }
+        }
+
+        if (isCloudAgentEnabled()) {
+            return await handleCloudAgentMessages(req, res);
         }
 
         // 转换为 Cursor 请求
